@@ -1,0 +1,33 @@
+# ---- Java / Maven ----
+target/
+*.class
+*.jar
+*.war
+.mvn/
+mvnw
+mvnw.cmd
+
+# ---- 运行时产物 ----
+backend/data/
+*.db
+*.mv.db
+*.trace.db
+*.log
+
+# ---- Node / 前端 ----
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# ---- 环境与密钥 ----
+.env
+.env.*
+!.env.example
+
+# ---- IDE / 系统 ----
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db

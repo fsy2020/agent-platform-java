@@ -1,0 +1,56 @@
+server:
+  port: 8000
+
+spring:
+  application:
+    name: rsi-agent-platform
+  datasource:
+    # H2 文件库：开箱即用；换 PostgreSQL 只需改这一段
+    url: jdbc:h2:file:./data/agent-platform;AUTO_SERVER=TRUE;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: false
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  threads:
+    virtual:
+      enabled: true
+
+agent:
+  jwt:
+    secret: ${JWT_SECRET:rsi-agent-platform-dev-secret-please-change-in-production-0123456789}
+    expire-minutes: 720
+  llm:
+    # 不配置也能运行：平台自动降级为规则引擎路由（demo 模式）
+    api-key: ${ANTHROPIC_API_KEY:}
+    primary-model: claude-opus-5
+    fallback-model: claude-sonnet-5
+    effort: high
+    max-tokens: 8000
+  runtime:
+    max-iterations: 12
+    route-confidence-threshold: 0.7
+    context-window-tokens: 180000
+    compress-trigger-ratio: 0.7
+    loop-repeat-threshold: 3
+  resilience:
+    tool-timeout-seconds: 30
+    tool-max-retries: 3
+    circuit-failure-rate: 0.6
+    circuit-window-seconds: 300
+    circuit-probe-seconds: 30
+
+logging:
+  level:
+    root: INFO
+    com.rsi.agent: INFO
+    org.hibernate.SQL: WARN
