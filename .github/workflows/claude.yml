@@ -1,0 +1,33 @@
+# 在 Issue / PR 评论里 @claude，让 Claude 分析代码、回答问题、直接提交改动。
+#
+# 认证：默认走订阅（本地 `claude setup-token` 生成，存为仓库 secret
+# CLAUDE_CODE_OAUTH_TOKEN）。若改用 API Key，把下面那行换成：
+#   anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  claude:
+    # 没提到 @claude 的评论不必启动 runner；action 自己也会再校验一次触发词
+    if: contains(github.event.comment.body, '@claude')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write        # 允许 Claude 修改文件并推送
+      pull-requests: write   # 允许创建 PR / 发评论
+      issues: write          # 允许回复 Issue
+      id-token: write        # action 默认的 GitHub App 认证需要
+      actions: read          # 让 Claude 能读 PR 上的 CI 结果
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

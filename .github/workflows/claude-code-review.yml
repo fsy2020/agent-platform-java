@@ -1,0 +1,40 @@
+# PR 打开或更新时自动 review，结论直接发在 PR 上。
+#
+# 两行不能删：
+#   --comment    没有它，review 只写进 workflow run log，PR 上什么都不显示
+#   claude_args  action 只有在 --allowedTools 里点名时，才会启动发 inline
+#                comment 的 MCP server —— 即使 skill 自己的 frontmatter
+#                已经声明了同一个工具
+#
+# Claude 会自动跳过草稿 PR、已关闭 PR、它判断不需要 review 的（自动化/琐碎改动），
+# 以及已经有过 Claude 评论的 PR。
+#
+# 认证：默认走订阅。若改用 API Key，把下面那行换成：
+#   anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+name: Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
