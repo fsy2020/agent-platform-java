@@ -23,13 +23,27 @@ import jakarta.persistence.Table;
 @Table(name = "sub_agents")
 public class SubAgentEntity extends BaseEntity {
 
+    /**
+     * 列宽上限。写入前的裁剪逻辑（见 {@code AgentCardService#applyCard}）必须与建表宽度
+     * 一致，拆成两处字面量迟早对不上，对不上的那一次就是一个 500。因此这里导出常量，
+     * 下方的 {@code @Column(length = ...)} 与裁剪逻辑共用同一份。
+     *
+     * <p>集合字段以 JSON 文本落库，上限约束的是<b>序列化结果</b>的字符数，不是元素个数。
+     */
+    public static final int TEXT_LENGTH = 255;
+    public static final int DESCRIPTION_LENGTH = 2000;
+    public static final int POSITIVE_EXAMPLES_LENGTH = 2000;
+    public static final int TAGS_LENGTH = 1000;
+    public static final int REMOTE_SKILLS_LENGTH = 4000;
+
     @Column(unique = true, nullable = false, length = 64)
     private String name;
 
+    @Column(length = TEXT_LENGTH)
     private String displayName = "";
 
     /** 路由依据：能力范围 + 输入输出规范。注册时强制校验长度。 */
-    @Column(length = 2000)
+    @Column(length = DESCRIPTION_LENGTH)
     private String description = "";
 
     private String businessDomain = "general";
@@ -51,7 +65,7 @@ public class SubAgentEntity extends BaseEntity {
 
     /** description 必须含正样例，否则路由误判率显著升高。 */
     @Convert(converter = JsonAttributeConverter.StringListConverter.class)
-    @Column(length = 2000)
+    @Column(length = POSITIVE_EXAMPLES_LENGTH)
     private List<String> positiveExamples = List.of();
 
     @Convert(converter = JsonAttributeConverter.StringListConverter.class)
@@ -63,7 +77,10 @@ public class SubAgentEntity extends BaseEntity {
     private List<String> usageExamples = List.of();
 
     private String owner = "";
+
+    @Column(length = TEXT_LENGTH)
     private String version = "1.0.0";
+
     private String riskLevel = "medium";
     private String status = "published";
     private boolean enabled = true;
@@ -74,7 +91,7 @@ public class SubAgentEntity extends BaseEntity {
     private int maxIterations = 6;
 
     @Convert(converter = JsonAttributeConverter.StringListConverter.class)
-    @Column(length = 1000)
+    @Column(length = TAGS_LENGTH)
     private List<String> tags = List.of();
 
     private long callCount = 0;
@@ -86,12 +103,15 @@ public class SubAgentEntity extends BaseEntity {
     private String transport = "local";
 
     /** A2A JSON-RPC 端点，取自 Agent Card 的 url 字段。 */
+    @Column(length = TEXT_LENGTH)
     private String endpoint = "";
 
     /** 拉取 Agent Card 的来源地址，用于后续刷新。 */
+    @Column(length = TEXT_LENGTH)
     private String cardUrl = "";
 
     /** 远端声明的 A2A 协议版本。仅记录并在不一致时告警，不做强校验。 */
+    @Column(length = TEXT_LENGTH)
     private String protocolVersion = "";
 
     /** 远端是否支持 message/stream —— 决定走流式还是阻塞 + 轮询。 */
@@ -110,7 +130,7 @@ public class SubAgentEntity extends BaseEntity {
 
     /** Agent Card 声明的 skills 原文，供审计比对与前端展示。 */
     @Convert(converter = JsonAttributeConverter.MapListConverter.class)
-    @Column(length = 4000)
+    @Column(length = REMOTE_SKILLS_LENGTH)
     private List<Map<String, Object>> remoteSkills = List.of();
 
     private Instant cardFetchedAt;
