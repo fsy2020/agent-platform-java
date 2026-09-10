@@ -31,3 +31,8 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # 输出语言的完整约定在仓库根 CLAUDE.md 里；这里再加一道 system prompt
+          # 级别的保险，因为 CLAUDE.md 是模型可权衡的上下文，而 system prompt 更硬。
+          # 若 CLAUDE.md 单独就足够稳定，这行可以删掉。
+          claude_args: |
+            --append-system-prompt "回复一律使用简体中文。代码标识符、API 字段名、日志与报错原文保持不变，不要翻译。"
