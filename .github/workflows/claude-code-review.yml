@@ -37,4 +37,8 @@ jobs:
           plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
           plugins: "code-review@claude-code-plugins"
           prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
-          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
+          # --allowedTools 不能删，原因见上。--append-system-prompt 是输出语言的
+          # 保险，完整约定在仓库根 CLAUDE.md 里。
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment"
+            --append-system-prompt "review 结论一律使用简体中文。代码标识符、API 字段名、日志与报错原文保持不变，不要翻译。"
