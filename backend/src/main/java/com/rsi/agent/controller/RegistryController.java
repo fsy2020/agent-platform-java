@@ -150,6 +150,30 @@ public class RegistryController {
         return agentService.create(request, identity);
     }
 
+    /**
+     * 通过 Agent Card 注册远程子 Agent。
+     *
+     * <p>业务方只交卡片地址与凭证，能力清单由远端自描述 ——
+     * 与 {@code /mcp/servers/{id}/discover} 是同一套思路。
+     */
+    @PostMapping("/agents/register-a2a")
+    @ResponseStatus(HttpStatus.CREATED)
+    public SubAgentDto registerA2aAgent(@RequestBody A2aRegisterRequest request,
+                                        @CurrentUser Identity identity) {
+        return agentService.registerA2a(request, identity);
+    }
+
+    /** 重新拉取 Agent Card。远端改了能力不会自动同步，必须显式刷新。 */
+    @PostMapping("/agents/{agentId}/refresh-card")
+    public SubAgentDto refreshAgentCard(@PathVariable String agentId) {
+        return agentService.refreshCard(agentId);
+    }
+
+    @PostMapping("/agents/{agentId}/health")
+    public Map<String, Object> agentHealth(@PathVariable String agentId) {
+        return agentService.health(agentId);
+    }
+
     @GetMapping("/agents/{agentId}")
     public SubAgentDto getAgent(@PathVariable String agentId) {
         return agentService.get(agentId);
