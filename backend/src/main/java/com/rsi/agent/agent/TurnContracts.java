@@ -11,8 +11,24 @@ public final class TurnContracts {
 
     private TurnContracts() {}
 
-    /** 审批放行后的恢复上下文：直接从执行节点续跑，不重新路由。 */
-    public record Resume(RoutePlan plan, String signature, String decision, String comment) {
+    /**
+     * 审批放行后的恢复上下文：直接从执行节点续跑，不重新路由。
+     *
+     * <p>本地执行的恢复是「重放这个决策」；远程 A2A 的恢复是「对那个还活着的
+     * 远端任务续发一条消息」—— 两者语义不同，因此 {@link RemoteTask} 独立成一段，
+     * 非空时优先走续发路径。
+     */
+    public record Resume(RoutePlan plan, String signature, String decision, String comment,
+                         RemoteTask remoteTask) {
+
+        /** 远端任务坐标。{@code agentName} 用于校验快照与当前委派目标一致。 */
+        public record RemoteTask(String agentName, String taskId, String contextId) {}
+
+        /** 本地恢复的便捷构造 —— 不涉及远端任务。 */
+        public Resume(RoutePlan plan, String signature, String decision, String comment) {
+            this(plan, signature, decision, comment, null);
+        }
+
         public boolean approved() { return "approved".equals(decision); }
     }
 

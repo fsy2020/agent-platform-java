@@ -9,6 +9,12 @@ import java.util.Map;
  * <p>事件名与既有前端契约一一对应：session / context / route / tool_start /
  * tool_end / skill_start / skill_end / agent_start / agent_end / guard /
  * approval_required / delta / answer / error / done。
+ *
+ * <p>远程（A2A）子 Agent 复用同一套事件名 —— {@code agent_start} 多带
+ * transport / endpoint / streaming，远端的 {@code input-required} 映射成
+ * {@code approval_required}，失败映射成 {@code guard}，因此前端契约无需变更。
+ * 唯一新增的是 {@code agent_progress}（远端逐帧产出与状态推进）；
+ * 不认识它的前端直接忽略即可，属于向后兼容的增量。
  */
 public record AgentEvent(String event, Map<String, Object> data) {
 

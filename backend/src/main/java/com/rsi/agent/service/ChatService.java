@@ -121,13 +121,30 @@ public class ChatService {
         RoutePlan plan = rebuildPlan(payload);
         TurnContracts.Resume resume = new TurnContracts.Resume(plan,
                 String.valueOf(payload.getOrDefault("signature", "")),
-                approval.getStatus(), approval.getDecisionComment());
+                approval.getStatus(), approval.getDecisionComment(),
+                rebuildRemoteTask(payload));
 
         String question = String.valueOf(payload.getOrDefault("question", ""));
         ResponseBodyEmitter emitter = new ResponseBodyEmitter(300_000L);
         executor.execute(() ->
                 runTurn(emitter, approval.getSessionId(), question, identity, resume));
         return emitter;
+    }
+
+    /**
+     * 从审批快照重建远端任务坐标。
+     *
+     * <p>只有远程子 Agent 主动要求人工输入时才会写这几个字段。恢复时凭它们
+     * 对那个仍在 {@code input-required} 状态的远端任务续发消息，而不是重新委派 ——
+     * 重新委派会让远端起一个新任务，旧任务悬空。
+     */
+    private TurnContracts.Resume.RemoteTask rebuildRemoteTask(Map<String, Object> payload) {
+        Object agentName = payload.get("a2a_agent");
+        if (agentName == null || String.valueOf(agentName).isBlank()) return null;
+        return new TurnContracts.Resume.RemoteTask(
+                String.valueOf(agentName),
+                String.valueOf(payload.getOrDefault("a2a_task_id", "")),
+                String.valueOf(payload.getOrDefault("a2a_context_id", "")));
     }
 
     /** 从审批快照重建执行路径。审批单里存的是决策本身，恢复时无需再问一次模型。 */

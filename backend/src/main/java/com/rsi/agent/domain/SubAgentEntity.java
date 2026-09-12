@@ -1,13 +1,24 @@
 package com.rsi.agent.domain;
 
+import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Convert;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Table;
 
-/** 子 Agent 注册模型 —— 业务方动态创建，运行时按身份/权限/意图裁剪暴露。 */
+/**
+ * 子 Agent 注册模型 —— 业务方动态创建，运行时按身份/权限/意图裁剪暴露。
+ *
+ * <p>两种形态由 {@link #transport} 区分：
+ * <ul>
+ *   <li>{@code local} —— 注册的只是配置（prompt + 工具白名单），ReAct 循环跑在本进程</li>
+ *   <li>{@code a2a} —— 注册的是外部部门自建服务的地址，走 A2A 协议远程调用；
+ *       本模型的大部分字段可由 Agent Card 自动填充</li>
+ * </ul>
+ */
 @Entity
 @Table(name = "sub_agents")
 public class SubAgentEntity extends BaseEntity {
@@ -69,6 +80,51 @@ public class SubAgentEntity extends BaseEntity {
     private long callCount = 0;
     private long successCount = 0;
 
+    // ---------------------------------------------------------- 远程接入（a2a）
+
+    /** local：平台内配置驱动；a2a：外部部门自建服务，走 A2A 协议远程调用。 */
+    private String transport = "local";
+
+    /** A2A JSON-RPC 端点，取自 Agent Card 的 url 字段。 */
+    private String endpoint = "";
+
+    /** 拉取 Agent Card 的来源地址，用于后续刷新。 */
+    private String cardUrl = "";
+
+    /** 远端声明的 A2A 协议版本。仅记录并在不一致时告警，不做强校验。 */
+    private String protocolVersion = "";
+
+    /** 远端是否支持 message/stream —— 决定走流式还是阻塞 + 轮询。 */
+    private boolean streaming = false;
+
+    private String authType = "none";
+
+    /** 服务间静态凭证。<b>含密文，禁止出现在任何 DTO 中。</b> */
+    @Convert(converter = JsonAttributeConverter.MapConverter.class)
+    @Column(length = 2000)
+    private Map<String, Object> authConfig = Map.of();
+
+    @Convert(converter = JsonAttributeConverter.MapConverter.class)
+    @Column(length = 1000)
+    private Map<String, Object> headers = Map.of();
+
+    /** Agent Card 声明的 skills 原文，供审计比对与前端展示。 */
+    @Convert(converter = JsonAttributeConverter.MapListConverter.class)
+    @Column(length = 4000)
+    private List<Map<String, Object>> remoteSkills = List.of();
+
+    private Instant cardFetchedAt;
+
+    private String healthStatus = "unknown";
+
+    @Column(length = 1000)
+    private String lastError = "";
+
+    /** 是否为远程 Agent —— 决定工具白名单是强制边界还是仅申报信息。 */
+    public boolean isRemote() {
+        return transport != null && !transport.isBlank() && !"local".equals(transport);
+    }
+
     public String getName() { return name; }
     public void setName(String v) { this.name = v; }
     public String getDisplayName() { return displayName; }
@@ -113,4 +169,28 @@ public class SubAgentEntity extends BaseEntity {
     public void setCallCount(long v) { this.callCount = v; }
     public long getSuccessCount() { return successCount; }
     public void setSuccessCount(long v) { this.successCount = v; }
+    public String getTransport() { return transport; }
+    public void setTransport(String v) { this.transport = v; }
+    public String getEndpoint() { return endpoint; }
+    public void setEndpoint(String v) { this.endpoint = v; }
+    public String getCardUrl() { return cardUrl; }
+    public void setCardUrl(String v) { this.cardUrl = v; }
+    public String getProtocolVersion() { return protocolVersion; }
+    public void setProtocolVersion(String v) { this.protocolVersion = v; }
+    public boolean isStreaming() { return streaming; }
+    public void setStreaming(boolean v) { this.streaming = v; }
+    public String getAuthType() { return authType; }
+    public void setAuthType(String v) { this.authType = v; }
+    public Map<String, Object> getAuthConfig() { return authConfig; }
+    public void setAuthConfig(Map<String, Object> v) { this.authConfig = v; }
+    public Map<String, Object> getHeaders() { return headers; }
+    public void setHeaders(Map<String, Object> v) { this.headers = v; }
+    public List<Map<String, Object>> getRemoteSkills() { return remoteSkills; }
+    public void setRemoteSkills(List<Map<String, Object>> v) { this.remoteSkills = v; }
+    public Instant getCardFetchedAt() { return cardFetchedAt; }
+    public void setCardFetchedAt(Instant v) { this.cardFetchedAt = v; }
+    public String getHealthStatus() { return healthStatus; }
+    public void setHealthStatus(String v) { this.healthStatus = v; }
+    public String getLastError() { return lastError; }
+    public void setLastError(String v) { this.lastError = v; }
 }

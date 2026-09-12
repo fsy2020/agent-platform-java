@@ -48,6 +48,17 @@ agent:
     circuit-failure-rate: 0.6
     circuit-window-seconds: 300
     circuit-probe-seconds: 30
+  a2a:
+    # 远程子 Agent。注意：委派不重试（有副作用），只有熔断与超时
+    connect-timeout-seconds: 10
+    # 单帧读超时，流式场景下远端可能长时间静默
+    read-timeout-seconds: 120
+    # 整个远程任务的墙钟上限
+    task-timeout-seconds: 600
+    poll-interval-millis: 2000
+    card-timeout-seconds: 10
+    # 委派给平台管不到的外部服务前，对非 low 风险 Agent 走人工审批
+    require-delegation-approval: true
 
 logging:
   level:

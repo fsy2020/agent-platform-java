@@ -117,8 +117,17 @@ public final class RegistryDtos {
             List<String> requiredScopes, List<String> positiveExamples, List<String> negativeExamples,
             List<String> usageExamples, String owner, String version, String riskLevel, String status,
             boolean enabled, String tenantId, String model, int maxIterations, List<String> tags,
-            long callCount, long successCount, Instant createdAt, Instant updatedAt
+            long callCount, long successCount, Instant createdAt, Instant updatedAt,
+            // --- 远程接入（transport = a2a）---
+            String transport, String endpoint, String cardUrl, String protocolVersion,
+            boolean streaming, String authType, boolean credentialConfigured,
+            List<Map<String, Object>> remoteSkills, Instant cardFetchedAt,
+            String healthStatus, String lastError
     ) {
+        /**
+         * <b>authConfig 永不出现在这里。</b>凭证只存库、只在网关注入请求头，
+         * 不经由任何读接口回流 —— 注册页只回显"是否已配置"。
+         */
         public static SubAgentDto from(SubAgentEntity agent) {
             return new SubAgentDto(agent.getId(), agent.getName(), agent.getDisplayName(),
                     agent.getDescription(), agent.getBusinessDomain(), agent.getSystemPrompt(),
@@ -127,7 +136,12 @@ public final class RegistryDtos {
                     agent.getOwner(), agent.getVersion(), agent.getRiskLevel(), agent.getStatus(),
                     agent.isEnabled(), agent.getTenantId(), agent.getModel(), agent.getMaxIterations(),
                     agent.getTags(), agent.getCallCount(), agent.getSuccessCount(),
-                    agent.getCreatedAt(), agent.getUpdatedAt());
+                    agent.getCreatedAt(), agent.getUpdatedAt(),
+                    agent.getTransport(), agent.getEndpoint(), agent.getCardUrl(),
+                    agent.getProtocolVersion(), agent.isStreaming(), agent.getAuthType(),
+                    agent.getAuthConfig() != null && !agent.getAuthConfig().isEmpty(),
+                    agent.getRemoteSkills(), agent.getCardFetchedAt(),
+                    agent.getHealthStatus(), agent.getLastError());
         }
     }
 
@@ -136,6 +150,29 @@ public final class RegistryDtos {
             String systemPrompt, List<String> toolAllowlist, List<String> skillNames,
             List<String> requiredScopes, List<String> positiveExamples, List<String> negativeExamples,
             List<String> usageExamples, String owner, String version, String riskLevel, String status,
-            Boolean enabled, String tenantId, String model, Integer maxIterations, List<String> tags
+            Boolean enabled, String tenantId, String model, Integer maxIterations, List<String> tags,
+            String transport, String endpoint, String authType,
+            Map<String, Object> authConfig, Map<String, Object> headers
+    ) {}
+
+    /**
+     * A2A 子 Agent 注册请求。
+     *
+     * <p>业务方只需交出卡片地址与凭证；名称、描述、能力、正样例全部由
+     * Agent Card 自描述填充。平台侧治理属性（风险等级、所需 scope、租户）
+     * 仍由注册方在这里显式声明 —— 那不是远端能自证的东西。
+     */
+    public record A2aRegisterRequest(
+            String cardUrl,
+            String name,
+            String businessDomain,
+            String riskLevel,
+            List<String> requiredScopes,
+            List<String> negativeExamples,
+            String tenantId,
+            String owner,
+            String authType,
+            Map<String, Object> authConfig,
+            Map<String, Object> headers
     ) {}
 }

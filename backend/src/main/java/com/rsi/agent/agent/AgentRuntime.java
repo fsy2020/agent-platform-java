@@ -11,6 +11,7 @@ import java.util.function.Consumer;
 import com.rsi.agent.agent.CapabilitySnapshot.ToolEntry;
 import com.rsi.agent.agent.guard.AnswerVerifier;
 import com.rsi.agent.agent.guard.LoopGuard;
+import com.rsi.agent.agent.transport.DelegationContracts;
 import com.rsi.agent.config.AgentProperties;
 import com.rsi.agent.domain.ApprovalEntity;
 import com.rsi.agent.domain.McpToolEntity;
@@ -52,22 +53,26 @@ public class AgentRuntime {
     private final LlmRouter llmRouter;
     private final RuleEngine ruleEngine;
     private final McpGateway gateway;
+    private final AgentGateway agentGateway;
     private final McpToolRepository toolRepository;
     private final ApprovalRepository approvalRepository;
     private final AgentProperties.Runtime config;
+    private final AgentProperties.A2a a2aConfig;
 
     public AgentRuntime(CapabilityRegistry registry, ContextAssembler contextAssembler,
                         LlmRouter llmRouter, RuleEngine ruleEngine, McpGateway gateway,
-                        McpToolRepository toolRepository, ApprovalRepository approvalRepository,
-                        AgentProperties properties) {
+                        AgentGateway agentGateway, McpToolRepository toolRepository,
+                        ApprovalRepository approvalRepository, AgentProperties properties) {
         this.registry = registry;
         this.contextAssembler = contextAssembler;
         this.llmRouter = llmRouter;
         this.ruleEngine = ruleEngine;
         this.gateway = gateway;
+        this.agentGateway = agentGateway;
         this.toolRepository = toolRepository;
         this.approvalRepository = approvalRepository;
         this.config = properties.runtime();
+        this.a2aConfig = properties.a2a();
     }
 
     /** 一次 turn 的可变状态。集中在一个对象里，避免十几个参数在方法间传递。 */
@@ -439,102 +444,168 @@ public class AgentRuntime {
             return;
         }
         SubAgentEntity agent = found.get();
-        List<ToolEntry> tools = registry.agentTools(request.snapshot(), agent);
 
-        emit.accept(AgentEvent.of("agent_start",
-                "agent", agent.getName(), "display_name", agent.getDisplayName(),
-                "tools", tools.stream().map(ToolEntry::qualifiedName).toList(),
-                "budget", agent.getMaxIterations()));
+        // 远程任务的续跑：审批已放行，直接对既有 taskId 续发消息，不重新委派
+        DelegationContracts.RemoteTask resumeTask = remoteResumeFor(request, agent);
 
-        // 子 Agent 的候选集只含自己的工具：越界与二次分发在这里被结构性杜绝
-        RouteCandidates candidates = registry.agentCandidates(tools);
-        CapabilitySnapshot subSnapshot = CapabilitySnapshot.ofTools(
-                tools, request.snapshot().totalToolCount());
-
-        String system = Prompts.subagentSystem(agent.getSystemPrompt())
-                + "\n\n" + candidates.describe(25);
-
-        List<String> subEvidence = new ArrayList<>();
-        int budget = agent.getMaxIterations() <= 0 ? 6 : agent.getMaxIterations();
-
-        for (int step = 1; step <= budget; step++) {
-            StringBuilder userPrompt = new StringBuilder("待办任务：").append(request.question()).append('\n');
-            if (!subEvidence.isEmpty()) {
-                userPrompt.append("\n已获取证据：\n");
-                subEvidence.forEach(item -> userPrompt.append("- ").append(item).append('\n'));
-            }
-            userPrompt.append("\n请决定下一步：调用工具（route_type=tool）、")
-                    .append("已可作答（route_type=answer，把结论写进 message）或需要澄清（clarify）。");
-
-            // 子 Agent 不再受置信度阈值二次拦截 —— 领域边界已由上层确定
-            LlmResult result = llmRouter.route(system, userPrompt.toString(),
-                    request.question(), candidates, false);
-            RoutePlan plan = result.plan() != null ? result.plan()
-                    : ruleEngine.route(request.question(), candidates, false);
-
-            TraceCollector collector = TraceContext.peek();
-            if (collector != null) {
-                collector.addTokens(result.promptTokens(), result.completionTokens());
-                if (result.degraded()) collector.markDegraded();
-            }
-            state.degraded = state.degraded || result.degraded();
-
-            if (!(plan instanceof RoutePlan.CallTool call)) {
-                String message = switch (plan) {
-                    case RoutePlan.Reply reply -> reply.message();
-                    case RoutePlan.Clarify clarify -> clarify.message();
-                    default -> "子 Agent 未产出结论。";
-                };
-                subEvidence.add("[%s] 结论：%s".formatted(agent.getName(), message));
-                break;
-            }
-
-            Optional<ToolEntry> entry = subSnapshot.tool(call.tool());
-            if (entry.isEmpty()) {
-                emit.accept(AgentEvent.of("guard", "kind", "out_of_scope_tool",
-                        "message", "子 Agent %s 请求了 allowlist 之外的工具 %s，已拦截。"
-                                .formatted(agent.getName(), call.tool())));
-                subEvidence.add("[%s] 尝试使用领域外工具 `%s`，已被工具边界拦截。"
-                        .formatted(agent.getName(), call.tool()));
-                break;
-            }
-
-            Map<String, Object> args = new LinkedHashMap<>(call.arguments());
-            if (args.isEmpty()) {
-                Map<String, Object> schema = entry.get().tool().getInputSchema();
-                args.putAll(ruleEngine.extractArguments(request.question(),
-                        CapabilityRegistry.requiredOf(schema), CapabilityRegistry.propertiesOf(schema)));
-            }
-
-            List<String> missing = AnswerVerifier.missingRequired(entry.get().tool().getInputSchema(), args);
-            if (!missing.isEmpty()) {
-                subEvidence.add("[%s] 缺少参数 %s，无法调用 `%s`。".formatted(
-                        agent.getName(), String.join(", ", missing), entry.get().qualifiedName()));
-                break;
-            }
-
-            if (guardBlocked(entry.get().qualifiedName(), args, state, emit)) break;
-
-            if (requiresApproval(entry.get())) {
-                boolean allowed = passApproval(entry.get().qualifiedName(), args, state, emit,
-                        request, delegate, "agent", agent.getName(), entry.get());
-                if (!allowed) {
-                    state.evidence.addAll(subEvidence);
-                    return;
-                }
-            }
-
-            ToolResult toolResult = invokeTool(entry.get(), args, state, emit,
-                    Map.of("agent", agent.getName()));
-            subEvidence.add("[%s] `%s` → %s".formatted(agent.getName(),
-                    entry.get().qualifiedName(), toolResult.summary(400)));
-
-            // 规则引擎模式下模型无法判断证据是否充分，成功取得结果后即收敛，避免空转
-            if (state.degraded && toolResult.success()) break;
+        // 委派前的粗粒度审批：把任务交给平台管不到的外部服务，是需要留痕的动作。
+        // 本地子 Agent 不走这一关 —— 它的每一次工具调用都已在平台侧逐个把关。
+        if (resumeTask == null && requiresDelegationApproval(agent)
+                && !passApproval("agent:" + agent.getName(),
+                        Map.of("task", request.question()), state, emit, request, delegate,
+                        "agent", agent.getName(), null)) {
+            return;
         }
 
-        emit.accept(AgentEvent.of("agent_end", "agent", agent.getName(), "steps", subEvidence.size()));
-        state.evidence.addAll(subEvidence);
+        DelegationContracts.Request delegation = new DelegationContracts.Request(
+                agent, request.question(), request.identity(), request.snapshot(),
+                request.sessionId(), request.traceId(), resumeTask);
+
+        DelegationContracts.Result result = agentGateway.delegate(
+                delegation, delegationHost(state, emit, request, delegate, agent), emit);
+
+        state.evidence.addAll(result.evidence());
+
+        // 宿主已在 State 上记录了挂起/拒绝（本地子 Agent 撞上工具审批）
+        if (result.suspended()) return;
+
+        // 远端主动要求人工输入：转成平台审批单，把 taskId 存进恢复快照
+        if (result.needsInput()) {
+            Map<String, Object> approval = createRemoteApproval(request, agent, result);
+            state.pendingApproval = approval;
+            state.status = "waiting_approval";
+            emit.accept(AgentEvent.of("approval_required", approval));
+            return;
+        }
+
+        // 失败不中断编排：证据已记下，交给下一轮路由重新决策或收敛为答复
+        if (result.failed()) {
+            emit.accept(AgentEvent.of("guard", "kind", "agent_failed",
+                    "message", "子 Agent %s 执行失败（%s）：%s".formatted(
+                            agent.getName(), result.errorType(), result.errorMessage())));
+        }
+    }
+
+    /**
+     * 传输层回调宿主。
+     *
+     * <p>护栏、审批、工具调用三道关卡留在运行时，传输层只能通过这个接口触达 ——
+     * 本地子 Agent 因此无法绕开平台的把关自行发起调用。
+     */
+    private DelegationContracts.Host delegationHost(State state, Consumer<AgentEvent> emit,
+                                                    TurnContracts.Request request,
+                                                    RoutePlan plan, SubAgentEntity agent) {
+        return new DelegationContracts.Host() {
+            @Override
+            public boolean degraded() {
+                return state.degraded;
+            }
+
+            @Override
+            public void markDegraded() {
+                state.degraded = true;
+            }
+
+            @Override
+            public boolean guardBlocked(String qualifiedName, Map<String, Object> args) {
+                return AgentRuntime.this.guardBlocked(qualifiedName, args, state, emit);
+            }
+
+            @Override
+            public DelegationContracts.Approval approval(ToolEntry entry, Map<String, Object> args) {
+                if (!requiresApproval(entry)) return DelegationContracts.Approval.NOT_REQUIRED;
+                boolean allowed = passApproval(entry.qualifiedName(), args, state, emit,
+                        request, plan, "agent", agent.getName(), entry);
+                if (allowed) return DelegationContracts.Approval.APPROVED;
+                return "waiting_approval".equals(state.status)
+                        ? DelegationContracts.Approval.PENDING
+                        : DelegationContracts.Approval.REJECTED;
+            }
+
+            @Override
+            public ToolResult invokeTool(ToolEntry entry, Map<String, Object> args,
+                                         Map<String, Object> extraEventFields) {
+                return AgentRuntime.this.invokeTool(entry, args, state, emit, extraEventFields);
+            }
+        };
+    }
+
+    /**
+     * 是否需要委派前审批。
+     *
+     * <p>只对远程 Agent 生效，且放行 low 风险 —— 否则每次跨部门查询都要人点一次，
+     * 审批会退化成橡皮图章，反而稀释了真正高风险动作的信号。
+     */
+    private boolean requiresDelegationApproval(SubAgentEntity agent) {
+        return agent.isRemote()
+                && a2aConfig.requireDelegationApproval()
+                && !"low".equals(agent.getRiskLevel());
+    }
+
+    /** 从恢复快照里取出远程任务坐标；不是同一个 Agent 的快照一律忽略。 */
+    private DelegationContracts.RemoteTask remoteResumeFor(TurnContracts.Request request,
+                                                           SubAgentEntity agent) {
+        if (!request.isResume()) return null;
+        TurnContracts.Resume.RemoteTask task = request.resume().remoteTask();
+        if (task == null || !agent.getName().equals(task.agentName())) return null;
+
+        String comment = request.resume().comment();
+        String reply = request.resume().approved()
+                ? (comment == null || comment.isBlank() ? "已批准，请继续执行。" : comment)
+                : "该请求已被拒绝，请勿执行该操作，并说明还缺少什么。";
+        return new DelegationContracts.RemoteTask(task.taskId(), task.contextId(), reply);
+    }
+
+    /**
+     * 远端要求人工输入 → 平台审批单。
+     *
+     * <p>与工具审批的关键差异：恢复快照里存的不是「重放哪个决策」，而是
+     * 「续发到哪个远程任务」—— A2A 的任务在远端仍然活着，等着我们回话。
+     */
+    private Map<String, Object> createRemoteApproval(TurnContracts.Request request,
+                                                     SubAgentEntity agent,
+                                                     DelegationContracts.Result result) {
+        String question = result.prompt();
+
+        ApprovalEntity approval = new ApprovalEntity();
+        approval.setSessionId(request.sessionId());
+        approval.setTraceId(request.traceId());
+        approval.setRequestedBy(request.identity().id());
+        approval.setExecutorType("agent");
+        approval.setExecutorName(agent.getName());
+        approval.setToolName("a2a:" + agent.getName());
+        approval.setToolArgs(Map.of("task", request.question()));
+        approval.setRiskLevel("high");
+        approval.setRiskReason("远程子 Agent 请求人工确认：" + question);
+        approval.setImpactScope("远端系统：%s（平台无法枚举其内部动作）".formatted(agent.getEndpoint()));
+
+        Map<String, Object> resume = new LinkedHashMap<>();
+        resume.put("route_type", "agent");
+        resume.put("target", agent.getName());
+        resume.put("arguments", Map.of());
+        resume.put("confidence", 1.0);
+        resume.put("reason", "远程任务等待人工输入");
+        resume.put("signature", "");
+        resume.put("question", request.question());
+        resume.put("a2a_agent", agent.getName());
+        resume.put("a2a_task_id", result.remoteTaskId());
+        resume.put("a2a_context_id", result.remoteContextId());
+        approval.setResumePayload(resume);
+        approvalRepository.save(approval);
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("id", approval.getId());
+        payload.put("executor_type", "agent");
+        payload.put("executor_name", agent.getName());
+        payload.put("tool_name", "a2a:" + agent.getName());
+        payload.put("tool_args", Map.of("task", request.question()));
+        payload.put("risk_level", "high");
+        payload.put("risk_reason", approval.getRiskReason());
+        payload.put("impact_scope", approval.getImpactScope());
+        payload.put("signature", "");
+        payload.put("remote_prompt", question);
+        payload.put("remote_task_id", result.remoteTaskId());
+        return payload;
     }
 
     // ------------------------------------------------------------------ 护栏与审批
@@ -603,15 +674,25 @@ public class AgentRuntime {
                                                ToolEntry entry, Map<String, Object> args,
                                                String signature) {
         String toolName = entry != null ? entry.qualifiedName() : executorName;
-        String impact = entry != null
-                ? "影响系统：%s；作用对象：%s".formatted(
-                        entry.server().getDisplayName().isBlank()
-                                ? entry.server().getName() : entry.server().getDisplayName(),
-                        args.isEmpty() ? "无参数" : describeArgs(args))
-                : "涉及多个下游系统的写操作";
-        String reason = entry != null
-                ? "`%s` 为写操作/高风险工具，执行后将变更下游业务系统数据。".formatted(toolName)
-                : "`%s` 被标记为高风险。".formatted(executorName);
+
+        // 三种关卡的影响面差别很大，审批人看到的必须是当前这一种，
+        // 否则「委派给外部 Agent」会被描述成「写操作」，评估依据就错了
+        String reason;
+        String impact;
+        if (entry != null) {
+            reason = "`%s` 为写操作/高风险工具，执行后将变更下游业务系统数据。".formatted(toolName);
+            impact = "影响系统：%s；作用对象：%s".formatted(
+                    entry.server().getDisplayName().isBlank()
+                            ? entry.server().getName() : entry.server().getDisplayName(),
+                    args.isEmpty() ? "无参数" : describeArgs(args));
+        } else if ("agent".equals(executorType)) {
+            reason = "即将把整个任务委派给子 Agent `%s` 执行。".formatted(executorName);
+            impact = "任务将整体移交给该 Agent。若为远程 Agent，其内部调用发生在平台之外，"
+                    + "平台无法逐个枚举或拦截 —— 放行等于信任该 Agent 在其声明范围内的全部动作。";
+        } else {
+            reason = "Skill `%s` 被标记为高风险。".formatted(executorName);
+            impact = "将按 Skill 定义依次调用多个下游系统，涉及写操作";
+        }
 
         ApprovalEntity approval = new ApprovalEntity();
         approval.setSessionId(request.sessionId());
