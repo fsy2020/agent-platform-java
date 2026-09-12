@@ -13,6 +13,7 @@ import com.rsi.agent.agent.a2a.A2aProtocol;
 import com.rsi.agent.agent.a2a.AgentCard;
 import com.rsi.agent.common.BizException;
 import com.rsi.agent.config.AgentProperties;
+import com.rsi.agent.domain.JsonAttributeConverter;
 import com.rsi.agent.domain.SubAgentEntity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,6 +34,28 @@ public class AgentCardService {
 
     private static final Logger log = LoggerFactory.getLogger(AgentCardService.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    // 用真正的列转换器算长度，而不是另起一个 ObjectMapper 估算 ——
+    // 估算值与 JPA 实际写入的文本一旦有出入，差的那几个字符就是一个 500
+    private static final JsonAttributeConverter.StringListConverter STRING_LIST =
+            new JsonAttributeConverter.StringListConverter();
+    private static final JsonAttributeConverter.MapListConverter MAP_LIST =
+            new JsonAttributeConverter.MapListConverter();
+
+    /** 各 skill 的 examples / tags 合并后的条数上限 —— 再多对路由匹配也没有增益。 */
+    private static final int EXAMPLE_COUNT = 12;
+    private static final int TAG_COUNT = 16;
+
+    // 单条文本的上限。先按条裁剪、再按列宽丢尾：否则远端写了一条超长 example，
+    // 序列化后一条就把整列占满，其余条目全被丢光，正样例反而更差。
+    // 这些值也保证了「最小的一条」一定塞得进对应的列，不至于裁成空集合。
+    private static final int EXAMPLE_LENGTH = 500;
+    private static final int TAG_LENGTH = 64;
+    private static final int SKILL_ID_LENGTH = 128;
+    private static final int SKILL_DESCRIPTION_LENGTH = 500;
+    private static final int SKILL_EXAMPLE_LENGTH = 200;
+    private static final int SKILL_TAG_COUNT = 8;
+    private static final int SKILL_EXAMPLE_COUNT = 4;
 
     private final RestClient client;
 
@@ -104,43 +127,107 @@ public class AgentCardService {
      * 否则远端一次改卡就能悄悄放宽自己在平台上的权限。
      */
     public void applyCard(SubAgentEntity agent, AgentCard card, String cardUrl) {
+        // 端点与卡片地址是调用链的硬依赖：截断只会得到一个打不通的地址，
+        // 与其存进去等运行时报错，不如在注册/刷新时就拒掉
+        String endpoint = requireFits(card.url(), SubAgentEntity.TEXT_LENGTH, "卡片 url");
+        String source = requireFits(cardUrl, SubAgentEntity.TEXT_LENGTH, "card_url");
+
         agent.setTransport("a2a");
-        agent.setEndpoint(card.url());
-        agent.setCardUrl(cardUrl);
-        agent.setProtocolVersion(card.protocolVersion());
+        agent.setEndpoint(endpoint);
+        agent.setCardUrl(source);
+        agent.setProtocolVersion(cap(card.protocolVersion(), SubAgentEntity.TEXT_LENGTH));
         agent.setStreaming(card.streaming());
         agent.setCardFetchedAt(Instant.now());
         agent.setHealthStatus("healthy");
         agent.setLastError("");
 
         if (agent.getDisplayName() == null || agent.getDisplayName().isBlank()) {
-            agent.setDisplayName(card.name());
+            agent.setDisplayName(cap(card.name(), SubAgentEntity.TEXT_LENGTH));
         }
-        agent.setDescription(card.routingDescription());
+        agent.setDescription(fitText(agent, "description",
+                card.routingDescription(), SubAgentEntity.DESCRIPTION_LENGTH));
         if (card.version() != null && !card.version().isBlank()) {
-            agent.setVersion(card.version());
+            agent.setVersion(cap(card.version(), SubAgentEntity.TEXT_LENGTH));
         }
 
         List<String> examples = card.allExamples();
         if (!examples.isEmpty()) {
-            agent.setPositiveExamples(examples.stream().limit(12).toList());
+            agent.setPositiveExamples(fitJson(agent, "positive_examples",
+                    capEach(examples, EXAMPLE_COUNT, EXAMPLE_LENGTH),
+                    SubAgentEntity.POSITIVE_EXAMPLES_LENGTH, STRING_LIST));
         }
         List<String> tags = card.allTags();
         if (!tags.isEmpty()) {
-            agent.setTags(tags.stream().limit(16).toList());
+            agent.setTags(fitJson(agent, "tags",
+                    capEach(tags, TAG_COUNT, TAG_LENGTH),
+                    SubAgentEntity.TAGS_LENGTH, STRING_LIST));
         }
 
         List<Map<String, Object>> skills = new ArrayList<>();
         for (AgentCard.Skill skill : card.skills()) {
             Map<String, Object> row = new LinkedHashMap<>();
-            row.put("id", skill.id());
-            row.put("name", skill.name());
-            row.put("description", skill.description());
-            row.put("tags", skill.tags());
-            row.put("examples", skill.examples());
+            row.put("id", cap(skill.id(), SKILL_ID_LENGTH));
+            row.put("name", cap(skill.name(), SKILL_ID_LENGTH));
+            row.put("description", cap(skill.description(), SKILL_DESCRIPTION_LENGTH));
+            row.put("tags", capEach(skill.tags(), SKILL_TAG_COUNT, TAG_LENGTH));
+            row.put("examples", capEach(skill.examples(), SKILL_EXAMPLE_COUNT, SKILL_EXAMPLE_LENGTH));
             skills.add(row);
         }
-        agent.setRemoteSkills(List.copyOf(skills));
+        agent.setRemoteSkills(fitJson(agent, "remote_skills", skills,
+                SubAgentEntity.REMOTE_SKILLS_LENGTH, MAP_LIST));
+    }
+
+    /**
+     * 裁到列宽以内。
+     *
+     * <p>卡片是外部产物，长度不由平台说了算：一份 skills 写得足够详尽的卡片，
+     * 序列化后轻松超过列宽，save 时炸成 {@code DataIntegrityViolationException} ——
+     * 那是一个 500，注册方从响应里根本看不出是哪个字段太长。这里在写入前就裁掉并留日志，
+     * 把「卡片写太长」降级成能力清单不完整，而不是整次注册/刷新失败。
+     *
+     * <p>裁剪一律从尾部开始：卡片按重要性从前往后排是通行写法，末尾条目丢失的代价最小。
+     */
+    private String fitText(SubAgentEntity agent, String field, String text, int limit) {
+        String value = cap(text, limit);
+        if (text != null && value.length() < text.strip().length()) {
+            log.warn("子 Agent {} 的 {} 超出列宽 {}（实际 {}），已截断",
+                    agent.getName(), field, limit, text.strip().length());
+        }
+        return value;
+    }
+
+    /** 逐条丢弃末尾元素，直到 JSON 序列化结果落进列宽。 */
+    private <T> List<T> fitJson(SubAgentEntity agent, String field, List<T> items, int limit,
+                                JsonAttributeConverter<List<T>> converter) {
+        List<T> kept = new ArrayList<>(items);
+        while (!kept.isEmpty() && converter.convertToDatabaseColumn(kept).length() > limit) {
+            kept.remove(kept.size() - 1);
+        }
+        if (kept.size() < items.size()) {
+            log.warn("子 Agent {} 的 {} 序列化后超出列宽 {}，已丢弃末尾 {} 项",
+                    agent.getName(), field, limit, items.size() - kept.size());
+        }
+        return List.copyOf(kept);
+    }
+
+    /** 超长即拒。用于截断后会失去意义的字段（地址一类）。 */
+    private String requireFits(String value, int limit, String field) {
+        String text = value == null ? "" : value.strip();
+        if (text.length() > limit) {
+            throw BizException.badRequest(
+                    "%s 长度 %d 超出上限 %d 字符".formatted(field, text.length(), limit));
+        }
+        return text;
+    }
+
+    private static List<String> capEach(List<String> values, int maxCount, int maxLength) {
+        return values.stream().limit(maxCount).map(v -> cap(v, maxLength)).toList();
+    }
+
+    /** 末位换成省略号，让「这里被裁过」在前端与审计记录里可见。 */
+    private static String cap(String text, int limit) {
+        String value = text == null ? "" : text.strip();
+        return value.length() <= limit ? value : value.substring(0, limit - 1) + "…";
     }
 
     /** 健康探活：能拉到卡片且端点未变即视为健康。 */
@@ -149,7 +236,7 @@ public class AgentCardService {
                 ? agent.getEndpoint() : agent.getCardUrl();
         try {
             AgentCard card = fetch(source, null);
-            if (!card.url().equals(agent.getEndpoint())) {
+            if (!card.url().strip().equals(agent.getEndpoint())) {
                 return new String[]{"degraded",
                         "卡片端点已变更为 %s，请重新拉取".formatted(card.url())};
             }
