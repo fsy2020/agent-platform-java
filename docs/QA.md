@@ -18,6 +18,9 @@
 9. Agent 如何保证权限？统一鉴权怎么做？错误码怎么写的？
 10. MCP 工具如何进行写操作？是否允许写操作？
 11. MCP 调用时，对端是 gRPC 就走 gRPC、是 HTTP 就走 HTTP，具体怎么调用的？
+12. 讲一次最大的线上故障：怎么定位的？临时方案是什么？长期怎么优化？
+13. token 评估为什么要做？「内部调用不需要过网关、stdio 不需要过网关」对吗？
+14. 生产上 Agent 报错吐 500，是服务端的问题吗？这个场景合理吗？
 
 ---
 ---
@@ -1587,6 +1590,397 @@ switch (server.getTransport()) {
 ---
 ---
 
+## Q12. 讲一次最大的线上故障：怎么定位、临时方案、长期方案
+
+### 故障本身
+
+**现象**：业务方注册远程子 Agent（`POST /api/agents/register-a2a`）时接口返回 500，
+响应体只有一句：
+
+```json
+{"detail": "DataIntegrityViolationException: could not execute statement"}
+```
+
+同一张卡片重试多少次都是 500。更麻烦的是第二条链路 —— 已经注册成功的 Agent，
+对端更新了自己的 Agent Card 之后，`POST /agents/{id}/refresh-card` 也开始报同样的 500，
+平台上这个 Agent 的能力清单**停在旧版本**，路由还按旧的 `description` 在匹配。
+
+**影响面**：A2A 注册与刷新两条链路，卡片写得越详细越容易中招 ——
+也就是说，**对端越认真，越注册不进来**。
+
+### 定位
+
+栈顶是 JPA 的 `save`，往下是 H2 的 value too long。对照 `SubAgentEntity` 的列宽：
+
+```java
+@Column(length = 2000)  private String description;          // 卡片的 routingDescription
+@Convert(converter = StringListConverter.class)
+@Column(length = 2000)  private List<String> positiveExamples;
+@Convert(converter = StringListConverter.class)
+@Column(length = 1000)  private List<String> tags;
+@Convert(converter = MapListConverter.class)
+@Column(length = 4000)  private List<Map<String, Object>> remoteSkills;
+```
+
+三个根因叠在一起：
+
+**① Agent Card 是外部产物，长度不由平台控制。** 卡片是对端团队写的 JSON，
+平台只是 `fetch` 回来。对端加几个 skill、把 `description` 写详细一点，
+就能越过任何一个列宽 —— 这是典型的「把外部输入当自己人」。
+
+**② 集合字段约束的是序列化结果，不是元素个数。** 老代码只做了条数限制：
+
+```java
+agent.setPositiveExamples(examples.stream().limit(12).toList());   // 出事的那一行
+```
+
+`limit(12)` 挡的是「条数」，但这几列存的是 `StringListConverter` 序列化出来的
+**JSON 文本**。对端写了一条 3000 字的 example，一条就把 2000 的列撑爆了，
+`limit(12)` 完全没拦住。
+
+**③ 错误分类错了。** 超长在 `save` 的那一刻才炸，
+`DataIntegrityViolationException` 一路逃到全局兜底：
+
+```java
+@ExceptionHandler(Exception.class)          // common/GlobalExceptionHandler.java
+public ResponseEntity<Map<String, Object>> handleOther(Exception ex, HttpServletRequest request) {
+    log.error("未处理异常 {} {}", request.getMethod(), request.getRequestURI(), ex);
+    return ResponseEntity.status(ErrorCode.INTERNAL.status()) ...   // ← 500
+}
+```
+
+于是「对端的输入不合法」在监控上显示成「平台内部错误」。
+注册方看到 500 的第一反应是「平台挂了，我再试一次」，而重试一万次也不会成功。
+
+### 临时方案（止血，不改库表）
+
+1. **摘掉定时刷新**：先让已注册的 Agent 停在旧卡片上可用，
+   避免刷新链路把健康状态刷成 `down`，把「注册不进来」和「已有的用不了」切开。
+2. **人工精简卡片**：让对端把 skills 描述压一压，重注册一次先把业务跑通。
+3. **在写库前加一道长度判断，直接回 400，把哪个字段超了写进 `detail`**：
+   止血阶段的目标不是让它成功，而是**让对方知道为什么失败** ——
+   一次说清楚的 400 比三次 500 有用得多。
+
+临时方案刻意没有动库表。`ALTER TABLE` 放宽列宽看起来最快，但列宽放到多大都还是一个
+**外部可控的数**，下次卡片再长一点又会炸，只是把同一个故障推迟到下一次。
+
+### 长期方案（已合入 `ada9ab5`）
+
+**① 收敛到唯一写入点。** `applyCard` 是 `registerA2a` 与 `refreshCard`
+**唯一**的卡片写入点，裁剪放在这里，两条链路同时覆盖，不会出现「注册裁了、刷新没裁」。
+
+**② 按字段性质分成两类处置，不搞一刀切：**
+
+| 字段 | 处置 | 为什么 |
+| --- | --- | --- |
+| `description` / `displayName` / `version` / `protocolVersion` | 截断 + `log.warn` | 描述性内容，裁掉尾巴不影响可用性 |
+| `positiveExamples` / `tags` / `remoteSkills` | 先按条裁，再逐条丢尾，直到序列化结果落进列宽 | 集合列存的是 JSON 文本，必须按文本长度收敛 |
+| `endpoint` / `cardUrl` | 直接 `BizException.badRequest` → **400** | 截断只会得到一个打不通的地址，存进去等于把问题推到运行时 |
+
+```java
+// service/AgentCardService.java
+String endpoint = requireFits(card.url(), SubAgentEntity.TEXT_LENGTH, "卡片 url");
+String source   = requireFits(cardUrl,    SubAgentEntity.TEXT_LENGTH, "card_url");
+...
+agent.setDescription(fitText(agent, "description",
+        card.routingDescription(), SubAgentEntity.DESCRIPTION_LENGTH));
+agent.setPositiveExamples(fitJson(agent, "positive_examples",
+        capEach(examples, EXAMPLE_COUNT, EXAMPLE_LENGTH),
+        SubAgentEntity.POSITIVE_EXAMPLES_LENGTH, STRING_LIST));
+```
+
+**③ 长度用真正的列转换器算，不另起一个 `ObjectMapper` 估算。**
+
+```java
+private static final JsonAttributeConverter.StringListConverter STRING_LIST = ...;
+private static final JsonAttributeConverter.MapListConverter MAP_LIST = ...;
+```
+
+估算值与 JPA 实际写入的文本一旦差几个字符，差的那一次就又是一个 500。
+
+**④ 列宽导出为常量，与 `@Column(length = ...)` 共用同一份。**
+
+```java
+// domain/SubAgentEntity.java
+public static final int DESCRIPTION_LENGTH = 2000;
+@Column(length = DESCRIPTION_LENGTH) private String description = "";
+```
+
+裁剪阈值和建表宽度写成两处字面量，迟早对不上，对不上的那一次就是一个 500。
+
+**⑤ 单条上限保证「最小的一条」一定塞得下。**
+`EXAMPLE_LENGTH = 500`、`TAG_LENGTH = 64`，先按条裁、再丢尾。
+如果只按列宽丢尾，对端一条超长 example 就会把其余条目全挤掉，
+`positiveExamples` 被裁成空集合 —— 而空的正样例会让
+`validateRoutingQuality` 误判成「这张卡片没给正样例」，
+故障从「注册失败」变成「注册成功但路由变差」，那种更难查。
+
+**⑥ 回归测试锁住三条不变量**（`AgentCardServiceTest`）：
+超长卡片每一列都塞得下、至少保留一条 example/tag/skill、`endpoint` 超长抛
+`ErrorCode.BAD_REQUEST`。
+
+### 复盘：这次故障真正的教训
+
+**不是「忘了校验长度」，是「把外部输入当成了自己的数据」。**
+A2A 场景下 Agent Card 与 MCP 的 `tools/list` 都是对端自描述的结构，
+平台侧的每一个 `@Column(length = ...)`，对外都是一条**没有写进接口文档的隐式契约**。
+凡是外部产物落库，边界必须在**写库之前**、在服务层显式表达，
+而不是交给数据库约束在 `save` 的瞬间用异常告诉你。
+
+### 还没做完的部分（如实标注）
+
+全局兜底目前会把异常类名和 message 直接写进响应体：
+
+```java
+.body(Map.of("detail", ex.getClass().getSimpleName() + ": " + ex.getMessage()));
+```
+
+对调用方没有信息量，还可能泄漏表名、列名、SQL 片段。应该改成：
+兜底只回 `traceId` + 通用文案，细节进日志；
+`DataIntegrityViolationException` 这类「输入导致」的异常单独映射成 4xx。
+
+### 另一个量级更大、但发现在验收期的 bug
+
+**审批放行后工具被执行了两次**（详见 Q10）。它比这次 500 更贵 ——
+500 是「做不成」，重复执行是「做了两遍」，落到 `finance.submit_expense`
+就是重复提交一笔报销。根因是恢复流程走完 `execute` 之后又落回了主循环，
+修复方式是恢复分支 `execute` 之后直接进 `finalize`，不回主循环。
+写操作的幂等必须在验收里专门测，不能等线上告诉你。
+
+**代码位置**：`service/AgentCardService.java`、`domain/SubAgentEntity.java`、
+`common/GlobalExceptionHandler.java`、`test/.../AgentCardServiceTest.java`
+
+---
+
+## Q13. token 评估为什么要做？「内部调用不需要过网关」对吗？
+
+这一题有两个互相独立的质疑，分开答。
+
+### 一、token 评估：估算和真实值是两个数，用途不重叠
+
+平台里有**两套** token 数字，混为一谈就会得出「估算没必要」的结论：
+
+| 数字 | 来源 | 用途 | 精度要求 |
+| --- | --- | --- | --- |
+| `context_tokens` | 本地估算 `ContextAssembler.estimateTokens` | **调用前**决定要不要压缩上下文 | 低，只要能过阈值 |
+| `prompt_tokens` / `completion_tokens` | LLM 响应里的 `usage` | trace、成本看板、评估汇总 | 精确，直接用真实值 |
+
+```java
+// llm/AnthropicClient.java —— 真实值，不估算
+usage.path("input_tokens").asInt(0),
+usage.path("output_tokens").asInt(0));
+```
+
+所以「不需要估算」这句话，**成立的那一半我们本来就是这么做的**：
+计费、统计、`TraceService` 的 `total_tokens`、`EvaluationService` 的汇总，
+用的全是 API 返回的真实 usage，一个估算值都没有。
+
+**不成立的那一半是压缩触发**：
+
+```java
+// agent/ContextAssembler.java
+if (tokens > config.contextWindowTokens() * config.compressTriggerRatio()) {   // 180_000 * 0.7
+    Compression compression = compress(turns, summary);
+```
+
+这个判断必须发生在**请求发出之前**。真实 usage 只有调用完才拿得到，
+那时候要么已经被模型以 `context_length_exceeded` 打回（用户看到一次失败的对话），
+要么钱已经花掉了。事后精确，不如事前有个够用的数。
+
+**替代方案为什么不选：**
+
+- **调官方 `count_tokens` 接口**：每轮多一次网络往返和一个失败点，
+  而且它只告诉你「现在多少」，不能替你决定「压到多少」——
+  压缩策略（保留头尾、压中段）还是要自己写。为一个阈值判断付一次 RTT 不划算。
+- **干脆不压缩，等模型报错再退化**：这等于把一个可以预判的问题
+  变成用户可见的失败，而且长会话必然触发。
+
+**精度够不够用：**
+
+```java
+/** 粗略 token 估算：中文按 1 字≈1 token，其余按 4 字符≈1 token。 */
+public static int estimateTokens(String text) {
+    long cjk = CJK.matcher(text).results().count();
+    long rest = text.length() - cjk;
+    return (int) (cjk + Math.max(1, rest / 4));
+}
+```
+
+两档系数对中英混排文本的误差在 ±15% 量级，而阈值取的是窗口的 **0.7** ——
+留了 30% 余量，正好覆盖估算误差。这是个刻意的设计：
+**把精度需求转移到阈值余量上，就不需要精确的 tokenizer。**
+
+代价也如实说：大段 base64、代码、日志这类文本会被系统性低估；
+且目前压缩只做一轮，压完仍然超限不会再处理。要补的话是两件事 ——
+压缩后加一次阈值复核并硬截断证据区，以及把两档系数按模型做成配置项。
+
+### 二、「内部调用不需要过网关」：先分清是哪个网关
+
+这句话里的「网关」有两个所指，一个对、一个不对。
+
+**① 网络出口网关（API 网关 / egress proxy）—— 对端说得对。**
+
+只有 `streamable_http` 和 `sse` 会产生出网流量，
+需要 TLS、出口白名单、限流、审计。`stdio` 是本机 `fork` 子进程走 stdin/stdout，
+`builtin` 是进程内反射调用，两者**没有一个字节走网络**，套网络网关没有意义。
+代码就是这么分层的 —— 认证头注入只存在于 HTTP/SSE 传输里：
+
+```java
+// mcp/transport/HttpTransport.java
+.headers(headers -> authHeaders(server).forEach(headers::set))
+```
+
+```java
+// mcp/transport/StdioTransport.java —— 没有任何网络相关代码
+ProcessBuilder builder = new ProcessBuilder(command);
+server.getEnv().forEach((k, v) -> builder.environment().put(k, String.valueOf(v)));
+```
+
+**② `McpGateway` —— 它不是网络网关，是进程内的调用门面，四种传输都必须过。**
+
+它管的是和协议无关的四件事：
+
+```java
+// mcp/McpGateway.java
+public ToolResult call(McpServerEntity server, String toolName, Map<String, Object> args) {
+    try {
+        Object data = invoker.invoke(server, toolName, args);
+        ...
+    } catch (CircuitOpenException e) { return ToolResult.fail("circuit_open", ..., false, ...); }
+      catch (TimeoutException e)     { return ToolResult.fail("timeout", "调用超时", true, ...); }
+      catch (IllegalArgumentException e) { return ToolResult.fail("invalid_arguments", ..., false, ...); }
+      catch (Exception e)            { return ToolResult.fail("transport_error", ..., true, ...); }
+}
+```
+
+错误码归一化、结果摘要、耗时统计，以及最关键的一点 ——
+**把所有调用收敛到同一个 `ToolInvoker.invoke` 上**，
+让 `@Resilient`（超时 → 指数退避 → 熔断）和 `@Traced` 只需要织一次。
+
+**stdio 恰恰更需要这一层，不是更不需要：**
+
+| stdio 的风险 | 谁兜 |
+| --- | --- |
+| 子进程不退出，读 stdout 永久阻塞 | `@Resilient` 的独立线程 + `Future.get` 超时 |
+| 命令写错 / 依赖缺失，每次必失败 | 熔断器，按 `#server.name` 分组 |
+| 每次调用 `fork` 一个进程，成本不低 | 熔断 + 统一延迟统计，才看得出来 |
+| 模型可以拉起本机进程 | `@RequiresScope("mcp:write")` + 只有管理员能注册 stdio server |
+
+最后一条是要点：**stdio 的风险模型比 HTTP 更高，不是更低** ——
+HTTP 传输最坏是打一个外部接口，stdio 最坏是在平台所在的机器上执行命令。
+真让它「不走网关」直连，等于给模型开了一条本机执行路径。
+
+**更硬的一层边界：护栏、审批、scope 裁剪三道闸在 `AgentRuntime` 上。**
+传输层不允许自行发起调用 —— 不管 builtin、stdio 还是 http，
+工具要先进候选集（scope 裁剪）、通过护栏、必要时走审批，才轮得到
+`McpGateway.call`。这三道闸和「有没有网络」没有关系，
+所以「内部调用就不用过」在这一层是不成立的。
+
+**如实标注一处缺口**：`McpRegistryService` 目前只校验 `transport` 枚举，
+**没有 command 白名单**，stdio 注册的安全性完全靠接口层的 `mcp:write` scope 兜。
+生产化要补的是一张可执行命令白名单 + 参数校验。
+
+**代码位置**：`agent/ContextAssembler.java`、`llm/AnthropicClient.java`、
+`mcp/McpGateway.java`、`mcp/ToolInvoker.java`、`mcp/transport/`、`aspect/ResilienceAspect.java`
+
+---
+
+## Q14. Agent 报错吐 500 —— 是服务端的问题吗？这个场景合理吗？
+
+### 谁吐的 500：是我们自己的后端
+
+不是模型，不是下游业务系统。平台里 500 只有**一个出口**：
+
+```java
+// common/GlobalExceptionHandler.java
+@ExceptionHandler(Exception.class)
+public ResponseEntity<Map<String, Object>> handleOther(Exception ex, HttpServletRequest request) {
+    log.error("未处理异常 {} {}", request.getMethod(), request.getRequestURI(), ex);
+    return ResponseEntity.status(ErrorCode.INTERNAL.status()) ...
+}
+```
+
+凡是没有被显式映射成 `BizException` 的异常，都会掉进这个兜底变成 500。
+Q12 那次故障就是这么来的：`DataIntegrityViolationException` 没人认领 → 500。
+
+`BizException` 走的是另一条路，状态码由 `ErrorCode` 决定，不会是 500：
+
+```java
+BAD_REQUEST(400) UNAUTHORIZED(401) FORBIDDEN(403)
+NOT_FOUND(404) CONFLICT(409) UPSTREAM_ERROR(502) INTERNAL(500)
+```
+
+### 关键澄清：对话链路根本吐不出 500
+
+`/api/chat/stream` 是 SSE。响应头在第一帧就已经发出去了（200），
+之后编排里出任何错，HTTP 状态码都改不了，只能以事件帧告诉前端：
+
+```java
+// service/ChatService.java —— runTurn 的兜底
+} catch (Exception e) {
+    log.error("对话流执行失败", e);
+    send(emitter, "error", Map.of("message", ...));
+    send(emitter, "done", Map.of("status", "failed", "answer", "", "error", ...));
+    emitter.complete();
+}
+```
+
+`AgentRuntime.run` 内部还有一层同样性质的兜底，失败会收敛成
+`status=failed` 的正常 turn 结果并落 trace。
+
+**所以「agent 跑一半失败」在生产上的表现是 `done{status:"failed"}`，不是 500。**
+一旦真的看到 500，说明它发生在**管理面的 REST 接口**（注册、刷新卡片、审批恢复），
+而不是对话面 —— 这本身就是一条很有用的定位信息，能直接砍掉一半排查范围。
+
+### 这个场景合理吗：不合理，是分类错误
+
+判据很简单：
+
+> **调用方修改输入能让请求成功 → 4xx；改任何输入都不可能成功 → 5xx。**
+
+Agent Card 字段超长，对端把描述改短就能注册成功 —— 属于前者，
+返回 500 是错的。而且代价不只是「状态码不好看」：
+
+- 调用方看到 5xx 的标准反应是**重试**，而这个请求重试一万次都不会成功；
+- 监控上计入「平台可用性下降」，实际上平台一直是好的；
+- 响应体里只有 `DataIntegrityViolationException`，对端根本不知道要改哪个字段。
+
+修复后的分类：能救的字段截断（返回 200，另记 `log.warn`），
+救不了的 `endpoint` / `cardUrl` 明确回 400 并说明是哪个字段。
+
+**什么时候 500 才是合理的**：数据库连不上、序列化器坏了、代码本身有 bug ——
+即内部不变量被打破、与调用方输入无关的那些。这时候 500 是对的，
+但响应体也不该把内部细节吐出去，应该只回一个 traceId。
+
+### 反向的情况：远端 Agent 吐 500 给我们
+
+A2A 委派时对端返回 5xx，平台的处理是**归一化成失败证据，绝不重试**：
+
+```java
+// agent/transport/A2aAgentTransport.java
+} catch (Exception e) {
+    circuitBreaker.record(key, false);
+    evidence.add("[%s] 远程调用失败：%s".formatted(agent.getName(), detail));
+    return DelegationContracts.Result.failed(classify(e), detail, evidence, ...);
+}
+```
+
+这个类上**没有 `@Resilient`**，是刻意的：
+
+> 工具调用多为只读，重试是安全的；Agent 委派大概率有副作用，
+> 重试等于重复执行写操作。只有熔断与超时，没有重试。
+
+对端的 500 对我们而言只是一条证据 —— 交回给模型让它换路径或如实告诉用户，
+而不是把「远端失败」再包装成我们自己的 500 甩给前端。
+工具调用则相反，`transport_error` / `timeout` 标 `retryable=true`，
+由 `ResilienceAspect` 做指数退避重试。
+
+**代码位置**：`common/GlobalExceptionHandler.java`、`common/ErrorCode.java`、
+`service/ChatService.java`、`agent/AgentRuntime.java`、
+`agent/transport/A2aAgentTransport.java`
+
+---
+
 ## 附：本文提到的"尚未实现"清单
 
 如实标注，避免把设计意图当成既成事实：
@@ -1597,6 +1991,9 @@ switch (server.getTransport()) {
 | gRPC 传输 | 无，现有 4 种（builtin/stdio/streamable_http/sse） | 新增一个 `ToolTransport` 实现类，标 `@Component` |
 | 跨会话语义记忆 | 无，记忆止于会话内 | `session.summary` + `traces` 灌向量库，在 L2 检索注入 |
 | 分布式熔断状态 | 单机 `ConcurrentHashMap` | 多实例部署需换 Redis，否则每个实例各熔各的 |
+| 异常兜底不泄漏内部细节 | `handleOther` 直接回异常类名与 message | 兜底只回 traceId + 通用文案；`DataIntegrityViolationException` 单独映射成 4xx |
+| 上下文压缩的二次复核 | 只压一轮，压完仍超限不再处理 | 压缩后复核阈值并硬截断证据区；估算系数按模型配置化 |
+| stdio 可执行命令白名单 | 只校验 transport 枚举，靠 `mcp:write` scope 兜 | `McpRegistryService` 增加命令白名单与参数校验 |
 
 ## 附：问题与代码位置对照
 
@@ -1613,3 +2010,6 @@ switch (server.getTransport()) {
 | Q9 权限 / 鉴权 / 错误码 | `security/`、`aspect/ScopeCheckAspect.java`、`common/` |
 | Q10 写操作 | `annotation/McpTool.java`、`service/ApprovalService.java` |
 | Q11 传输协议 | `mcp/ToolTransport.java`、`mcp/ToolInvoker.java`、`mcp/transport/` |
+| Q12 线上故障 | `service/AgentCardService.java`、`domain/SubAgentEntity.java`、`common/GlobalExceptionHandler.java` |
+| Q13 token 评估 / 网关 | `agent/ContextAssembler.java`、`mcp/McpGateway.java`、`aspect/ResilienceAspect.java` |
+| Q14 500 与错误分类 | `common/GlobalExceptionHandler.java`、`service/ChatService.java`、`agent/transport/A2aAgentTransport.java` |
